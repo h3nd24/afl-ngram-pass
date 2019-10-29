@@ -74,8 +74,6 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   IntegerType *Int8Ty = IntegerType::getInt8Ty(C);
   IntegerType *Int32Ty = IntegerType::getInt32Ty(C);
-  IntegerType *IntLocTy =
-      IntegerType::getIntNTy(C, sizeof(PREV_LOC_T) * CHAR_BIT);
 
   /* Show a banner */
 
@@ -84,7 +82,7 @@ bool AFLCoverage::runOnModule(Module &M) {
   if (isatty(2) && !getenv("AFL_QUIET")) {
 
     SAYF(cCYA "afl-llvm-pass " cBRI VERSION cRST
-              " by <lszekeres@google.com, adrian.herrera@anu.edu.au>\n");
+              " by <lszekeres@google.com, adrian.herrera@anu.edu.au, hendra.gunadi@anu.edu.au>\n");
 
   } else
     be_quiet = 1;
@@ -122,30 +120,24 @@ bool AFLCoverage::runOnModule(Module &M) {
   }
 
   unsigned PrevLocSize = ngram_size - 1;
-  uint64_t PrevLocVecSize = PowerOf2Ceil(PrevLocSize);
-  VectorType *PrevLocTy = VectorType::get(IntLocTy, PrevLocVecSize);
 
   GlobalVariable *AFLPrevLoc = new GlobalVariable(
-      M, PrevLocTy, /* isConstant */ false, GlobalValue::ExternalLinkage,
+      M, PointerType::get(Int32Ty, 0), /* isConstant */ false, GlobalValue::ExternalLinkage,
       /* Initializer */ nullptr, "__afl_prev_loc",
       /* InsertBefore */ nullptr, GlobalVariable::GeneralDynamicTLSModel,
       /* AddressSpace */ 0, /* IsExternallyInitialized */ false);
 
-  /* Create the vector shuffle mask for updating the previous block history.
-     Note that the first element of the vector will store cur_loc, so just set
-     it to undef to allow the optimizer to do its thing. */
+  GlobalVariable *AFLInsertLoc = new GlobalVariable(
+      M, Int32Ty, /* isConstant */ false, GlobalValue::ExternalLinkage,
+      /* Initializer */ nullptr, "__afl_insert_location",
+      /* InsertBefore */ nullptr, GlobalVariable::GeneralDynamicTLSModel,
+      /* AddressSpace */ 0, /* IsExternallyInitialized */ false);
 
-  SmallVector<Constant *, 32> PrevLocShuffle = {UndefValue::get(Int32Ty)};
-
-  for (unsigned I = 0; I < PrevLocSize - 1; ++I) {
-    PrevLocShuffle.push_back(ConstantInt::get(Int32Ty, I));
-  }
-
-  for (unsigned I = PrevLocSize; I < PrevLocVecSize; ++I) {
-    PrevLocShuffle.push_back(ConstantInt::get(Int32Ty, PrevLocSize));
-  }
-
-  Constant *PrevLocShuffleMask = ConstantVector::get(PrevLocShuffle);
+  GlobalVariable *AFLAcc = new GlobalVariable(
+      M, Int32Ty, /* isConstant */ false, GlobalValue::ExternalLinkage,
+      /* Initializer */ nullptr, "__afl_acc",
+      /* InsertBefore */ nullptr, GlobalVariable::GeneralDynamicTLSModel,
+      /* AddressSpace */ 0, /* IsExternallyInitialized */ false);
 
   /* Instrument all the things! */
 
@@ -164,26 +156,16 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       unsigned int cur_loc = AFL_R(MAP_SIZE);
 
-      ConstantInt *CurLoc = ConstantInt::get(IntLocTy, cur_loc);
-
-      /* Load prev_loc_trans */
-
-      LoadInst *PrevLocVec = IRB.CreateLoad(AFLPrevLoc);
-      PrevLocVec->setMetadata(M.getMDKindID("nosanitize"),
-                              MDNode::get(C, None));
-
-      /* "For efficiency, we propose to hash the tuple as a key into the
-         hit_count map as (prev_block_trans << 1) ^ curr_block_trans, where
-         prev_block_trans = (block_trans_1 ^ ... ^ block_trans_(n-1)" */
-
-      Value *PrevLocTrans = IRB.CreateXorReduce(PrevLocVec);
+      ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
 
       /* Load SHM pointer */
 
+      LoadInst *Acc = IRB.CreateLoad(AFLAcc); /* load the accumulator */
+      Acc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
       LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
       MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
       Value *MapPtrIdx = IRB.CreateGEP(
-          MapPtr, IRB.CreateZExt(IRB.CreateXor(IRB.CreateLShr(PrevLocTrans, (uint64_t) 1) , CurLoc), Int32Ty));
+          MapPtr, IRB.CreateZExt(IRB.CreateXor(Acc, CurLoc), Int32Ty));
 
       /* Update bitmap */
 
@@ -193,15 +175,32 @@ bool AFLCoverage::runOnModule(Module &M) {
       IRB.CreateStore(Incr, MapPtrIdx)
           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
-      /* Update prev_loc history vector (by placing cur_loc at the head of the
-         vector and shuffle the other elements back by one) */
+      /* Load the circular queue at the current index*/
+      LoadInst *PrevLocVec = IRB.CreateLoad(AFLPrevLoc);
+      PrevLocVec->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      LoadInst *InsertLoc = IRB.CreateLoad(AFLInsertLoc);
+      InsertLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      Value *PrevLocIdx = IRB.CreateGEP(PrevLocVec, InsertLoc); 
 
-      Value *ShuffledPrevLoc = IRB.CreateShuffleVector(
-          PrevLocVec, UndefValue::get(PrevLocTy), PrevLocShuffleMask);
-      Value *UpdatedPrevLoc = IRB.CreateInsertElement(
-          ShuffledPrevLoc, IRB.CreateLShr(CurLoc, (uint64_t)0), (uint64_t)0);
-      StoreInst *Store = IRB.CreateStore(UpdatedPrevLoc, AFLPrevLoc);
-      Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      Value *LeftShiftedCurLoc = IRB.CreateLShr(CurLoc, (uint64_t)1); /* Right shift the current location */
+
+      /* Update the acummulator: Get OldestLoc, which is the oldest value to be removed from Acc */
+      /* Acc = Acc ^ CurLoc ^ OldestLoc. We don't even need flag, when the pointer wrap around then the array will have non-zero value. */
+      LoadInst *OldestLoc = IRB.CreateLoad(PrevLocIdx);
+      Value *NewAcc = IRB.CreateXor(IRB.CreateXor(Acc, CurLoc), OldestLoc);
+      IRB.CreateStore(NewAcc, AFLAcc) /* Store the new accumulator */
+          ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+      /* Insert the latest location right-shifted by one to the PrevLoc.
+         Note that currently we right-shift the entry as opposed to right-shift the acummulator before the index calculation.
+         Arguably they achieve the same effect and should have the same overhead. */
+      IRB.CreateStore(LeftShiftedCurLoc, PrevLocIdx)
+          ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+      /* Get the new insertion point, which is addition modulo PrevLocSize operation */ 
+      IRB.CreateStore(IRB.CreateURem(IRB.CreateAdd(InsertLoc, ConstantInt::get(Int32Ty, 1)), 
+          ConstantInt::get(Int32Ty, PrevLocSize)), AFLInsertLoc)
+          ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
       inst_blocks++;
     }

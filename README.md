@@ -1,14 +1,17 @@
 # AFL N-Gram Branch Coverage
 
-This is an LLVM-based implementation of the n-gram branch coverage proposed in
-the paper ["Be Sensitive and Collaborative: Analzying Impact of Coverage Metrics
-in Greybox Fuzzing"](https://www.usenix.org/system/files/raid2019-wang-jinghan.pdf),
-by Jinghan Wang, et. al.
+This is a modification to the LLVM-based implementation of the n-gram branch coverage 
+proposed in the paper ["Be Sensitive and Collaborative: Analzying Impact of Coverage 
+Metrics in Greybox Fuzzing"](https://www.usenix.org/system/files/raid2019-wang-jinghan.pdf),
+by Jinghan Wang, et. al. 
 
 Note that the original implementation (available
 [here](https://github.com/bitsecurerlab/afl-sensitive)) is built on top of AFL's
-QEMU mode. This is essentially a port that uses LLVM vectorized instructions to
-achieve the same results when compiling source code.
+QEMU mode. 
+
+We changed the data structure to keep track of the history into circular queue and 
+then using acummulator as opposed to recalculating the hash of the history every time. 
+Arguably this will yield constant overhead irrespective of the size of the history. 
 
 ## Usage
 

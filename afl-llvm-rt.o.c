@@ -59,7 +59,10 @@
 u8 __afl_area_initial[MAP_SIZE];
 u8 *__afl_area_ptr = __afl_area_initial;
 
-__thread PREV_LOC_T __afl_prev_loc[MAX_NGRAM_SIZE];
+__thread u32 __afl_prev_loc_initial[MAX_NGRAM_SIZE - 1];
+__thread u32 *__afl_prev_loc = 0; // __thread requires constant expression, which afl_pref_loc_initial apparently is not
+__thread u32 __afl_insert_location = 0;
+__thread u32 __afl_acc = 0;
 
 /* Running in persistent mode? */
 
@@ -90,6 +93,12 @@ static void __afl_map_shm(void) {
        our parent doesn't give up on us. */
 
     __afl_area_ptr[0] = 1;
+
+    /* Setup the circular queue for history and the acummulator */
+    __afl_prev_loc = __afl_prev_loc_initial;
+    memset(__afl_prev_loc, 0, (MAX_NGRAM_SIZE - 1) * sizeof(u32));
+    __afl_insert_location = 0;
+    __afl_acc = 0;
   }
 }
 
@@ -194,7 +203,12 @@ int __afl_persistent_loop(unsigned int max_cnt) {
 
       memset(__afl_area_ptr, 0, MAP_SIZE);
       __afl_area_ptr[0] = 1;
-      memset(__afl_prev_loc, 0, MAX_NGRAM_SIZE * sizeof(PREV_LOC_T));
+
+      /* Setup the circular queue for history and the acummulator */
+      __afl_prev_loc = __afl_prev_loc_initial;
+      memset(__afl_prev_loc, 0, (MAX_NGRAM_SIZE - 1) * sizeof(u32));
+      __afl_insert_location = 0;
+      __afl_acc = 0;
     }
 
     cycle_cnt = max_cnt;
@@ -209,8 +223,12 @@ int __afl_persistent_loop(unsigned int max_cnt) {
       raise(SIGSTOP);
 
       __afl_area_ptr[0] = 1;
-      memset(__afl_prev_loc, 0, MAX_NGRAM_SIZE * sizeof(PREV_LOC_T));
 
+      /* Setup the circular queue for history and the acummulator */
+      __afl_prev_loc = __afl_prev_loc_initial;
+      memset(__afl_prev_loc, 0, (MAX_NGRAM_SIZE - 1) * sizeof(u32));
+      __afl_insert_location = 0;
+      __afl_acc = 0;
       return 1;
 
     } else {
@@ -301,3 +319,19 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
     start++;
   }
 }
+
+//void print_stuff(u32 V1, u32 V2, u32 V3, u32 V4) {
+void print_stuff(u32 num, ...) {
+  FILE* log;
+  va_list a_list;
+  va_start( a_list, num );  
+  log = fopen("program_trace", "a");
+  for (int i = 0; i < num; i++) {
+    u32 V = va_arg(a_list,u32);
+    fprintf(log, "%X\t", V);
+  }
+  va_end(a_list);
+  fprintf(log, "\n");
+  fclose(log);
+}
+
