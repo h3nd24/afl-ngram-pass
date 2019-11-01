@@ -119,11 +119,11 @@ bool AFLCoverage::runOnModule(Module &M) {
     }
   }
 
-  unsigned PrevLocSize = ngram_size - 1;
+  unsigned HistSize = ngram_size - 1;
 
-  GlobalVariable *AFLPrevLoc = new GlobalVariable(
+  GlobalVariable *AFLHist = new GlobalVariable(
       M, PointerType::get(Int32Ty, 0), /* isConstant */ false, GlobalValue::ExternalLinkage,
-      /* Initializer */ nullptr, "__afl_prev_loc",
+      /* Initializer */ nullptr, "__afl_hist",
       /* InsertBefore */ nullptr, GlobalVariable::GeneralDynamicTLSModel,
       /* AddressSpace */ 0, /* IsExternallyInitialized */ false);
 
@@ -136,6 +136,12 @@ bool AFLCoverage::runOnModule(Module &M) {
   GlobalVariable *AFLAcc = new GlobalVariable(
       M, Int32Ty, /* isConstant */ false, GlobalValue::ExternalLinkage,
       /* Initializer */ nullptr, "__afl_acc",
+      /* InsertBefore */ nullptr, GlobalVariable::GeneralDynamicTLSModel,
+      /* AddressSpace */ 0, /* IsExternallyInitialized */ false);
+
+  GlobalVariable *AFLPrevLoc = new GlobalVariable(
+      M, Int32Ty, /* isConstant */ false, GlobalValue::ExternalLinkage,
+      /* Initializer */ nullptr, "__afl_prev_loc",
       /* InsertBefore */ nullptr, GlobalVariable::GeneralDynamicTLSModel,
       /* AddressSpace */ 0, /* IsExternallyInitialized */ false);
 
@@ -161,11 +167,18 @@ bool AFLCoverage::runOnModule(Module &M) {
       /* Load SHM pointer */
 
       LoadInst *Acc = IRB.CreateLoad(AFLAcc); /* load the accumulator */
+      LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc); /* load the previous block */
       Acc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-      LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
+      Value* CurEdge = IRB.CreateXor(CurLoc, PrevLoc); /* current edge: (prev_loc >> 1) ^ cur_loc = block_trans */
+      LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr); /* load the reference to the bitmap */
       MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+      /* hash to the bitmap, calculated as (prev_block_trans >> 1) ^ block_trans,
+         where prev_block_trans = (block_trans_1 ^ block_trans_2 ^ ... ^ block_trans_{n-1}).
+         As we already right shift the entry, we do not right shift Acc anymore, i.e.,
+         Acc = (prev_block_trans >> 1)  */
       Value *MapPtrIdx = IRB.CreateGEP(
-          MapPtr, IRB.CreateZExt(IRB.CreateXor(Acc, CurLoc), Int32Ty));
+          MapPtr, IRB.CreateZExt(IRB.CreateXor(Acc, CurEdge), Int32Ty));
 
       /* Update bitmap */
 
@@ -175,31 +188,35 @@ bool AFLCoverage::runOnModule(Module &M) {
       IRB.CreateStore(Incr, MapPtrIdx)
           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
-      /* Load the circular queue at the current index*/
-      LoadInst *PrevLocVec = IRB.CreateLoad(AFLPrevLoc);
-      PrevLocVec->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      /* Load the circular queue at the current index */
+      LoadInst *Hist = IRB.CreateLoad(AFLHist);
+      Hist->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
       LoadInst *InsertLoc = IRB.CreateLoad(AFLInsertLoc);
       InsertLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-      Value *PrevLocIdx = IRB.CreateGEP(PrevLocVec, InsertLoc); 
+      Value *HistIdx = IRB.CreateGEP(Hist, InsertLoc); 
 
-      Value *LeftShiftedCurLoc = IRB.CreateLShr(CurLoc, (uint64_t)1); /* Right shift the current location */
+      Value *RightShiftedCurEdge = IRB.CreateLShr(CurEdge, (uint64_t)1); /* Right shift the current edge */
 
-      /* Update the acummulator: Get OldestLoc, which is the oldest value to be removed from Acc */
-      /* Acc = Acc ^ CurLoc ^ OldestLoc. We don't even need flag, when the pointer wrap around then the array will have non-zero value. */
-      LoadInst *OldestLoc = IRB.CreateLoad(PrevLocIdx);
-      Value *NewAcc = IRB.CreateXor(IRB.CreateXor(Acc, CurLoc), OldestLoc);
+      /* Update the acummulator: Get OldestEdge, which is the oldest value to be removed from Acc.
+         Acc = Acc ^ CurEdge ^ OldestEdge. We don't even need flag, when the pointer wrap around then the array will have non-zero value. */
+      LoadInst *OldestEdge = IRB.CreateLoad(HistIdx);
+      Value *NewAcc = IRB.CreateXor(IRB.CreateXor(Acc, RightShiftedCurEdge), OldestEdge);
       IRB.CreateStore(NewAcc, AFLAcc) /* Store the new accumulator */
           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
-      /* Insert the latest location right-shifted by one to the PrevLoc.
+      /* Insert the latest location right-shifted by one to the Hist.
          Note that currently we right-shift the entry as opposed to right-shift the acummulator before the index calculation.
          Arguably they achieve the same effect and should have the same overhead. */
-      IRB.CreateStore(LeftShiftedCurLoc, PrevLocIdx)
+      IRB.CreateStore(RightShiftedCurEdge, HistIdx)
           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
       /* Get the new insertion point, which is addition modulo PrevLocSize operation */ 
       IRB.CreateStore(IRB.CreateURem(IRB.CreateAdd(InsertLoc, ConstantInt::get(Int32Ty, 1)), 
-          ConstantInt::get(Int32Ty, PrevLocSize)), AFLInsertLoc)
+          ConstantInt::get(Int32Ty, HistSize)), AFLInsertLoc)
+          ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+      /* Store the PrevLoc */
+      IRB.CreateStore(IRB.CreateLShr(CurLoc, (uint64_t) 1), AFLPrevLoc)
           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
       inst_blocks++;
